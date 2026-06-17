@@ -12,10 +12,28 @@ permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: Preflight check
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - name: Check secrets configured
+        id: check
+        run: |
+          if [ -z "${{ secrets.AWS_ROLE_ARN }}" ]; then
+            echo "AWS_ROLE_ARN not configured — skipping workflow until secrets are set."
+            echo "ready=false" >> $GITHUB_OUTPUT
+          else
+            echo "ready=true" >> $GITHUB_OUTPUT
+          fi
+
   apply-dev:
     name: Apply - dev
     runs-on: ubuntu-latest
     environment: dev
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -54,7 +72,8 @@ jobs:
     name: Apply - test
     runs-on: ubuntu-latest
     environment: test
-    needs: apply-dev
+    needs: [preflight, apply-dev]
+    if: needs.preflight.outputs.ready == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -93,7 +112,8 @@ jobs:
     name: Apply - staging
     runs-on: ubuntu-latest
     environment: staging
-    needs: apply-test
+    needs: [preflight, apply-test]
+    if: needs.preflight.outputs.ready == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -149,7 +169,8 @@ jobs:
     name: Apply - production
     runs-on: ubuntu-latest
     environment: production
-    needs: apply-staging
+    needs: [preflight, apply-staging]
+    if: needs.preflight.outputs.ready == 'true'
     steps:
       - uses: actions/checkout@v4
 
