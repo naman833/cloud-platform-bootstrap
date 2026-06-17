@@ -1,0 +1,7 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-platform-app
+  namespace: cloud-platform
+spec:
+  replicas: 3

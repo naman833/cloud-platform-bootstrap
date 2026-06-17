@@ -1,0 +1,108 @@
+name: Kubernetes Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'k8s/**'
+      - 'Dockerfile'
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  build-and-deploy:
+    name: Build, Push, Deploy - ${{ matrix.environment }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, test, staging, production]
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: tag
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Update kustomize image tag
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          cd k8s/overlays/${{ matrix.environment }}
+          kustomize edit set image cloud-platform-app=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Commit updated manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/overlays/${{ matrix.environment }}/kustomization.yaml
+          git diff --staged --quiet || git commit -m "ci: update ${{ matrix.environment }} image to ${{ steps.tag.outputs.tag }} [skip ci]"
+          git push
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ vars.AWS_REGION || 'us-east-1' }} \
+            --name cloud-platform-${{ matrix.environment }}
+
+      - name: Apply kustomize manifests
+        run: |
+          kustomize build k8s/overlays/${{ matrix.environment }} | kubectl apply -f -
+
+      - name: Wait for rollout
+        id: rollout
+        run: |
+          kubectl rollout status deployment/cloud-platform-app \
+            -n cloud-platform \
+            --timeout=300s
+        continue-on-error: true
+
+      - name: Trigger rollback on failure
+        if: steps.rollout.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'rollback.yml',
+              ref: 'main',
+              inputs: {
+                environment: '${{ matrix.environment }}',
+                rollback_type: 'k8s'
+              }
+            });
+
+      - name: Fail if rollout failed
+        if: steps.rollout.outcome == 'failure'
+        run: exit 1

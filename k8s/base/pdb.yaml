@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloud-platform-app
+  namespace: cloud-platform
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: cloud-platform-app

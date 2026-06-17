@@ -1,0 +1,101 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to roll back"
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+          - staging
+          - production
+      rollback_type:
+        description: "What to roll back"
+        required: true
+        type: choice
+        options:
+          - k8s
+          - terraform
+          - both
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rollback:
+    name: Rollback ${{ inputs.rollback_type }} in ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Update kubeconfig
+        if: inputs.rollback_type == 'k8s' || inputs.rollback_type == 'both'
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ vars.AWS_REGION || 'us-east-1' }} \
+            --name cloud-platform-${{ inputs.environment }}
+
+      - name: Kubernetes rollback
+        if: inputs.rollback_type == 'k8s' || inputs.rollback_type == 'both'
+        run: |
+          kubectl rollout undo deployment/cloud-platform-app -n cloud-platform
+          kubectl rollout status deployment/cloud-platform-app -n cloud-platform --timeout=300s
+
+      - name: Setup Terraform
+        if: inputs.rollback_type == 'terraform' || inputs.rollback_type == 'both'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Init
+        if: inputs.rollback_type == 'terraform' || inputs.rollback_type == 'both'
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+        working-directory: terraform/environments/${{ inputs.environment }}
+
+      - name: Terraform Plan Destroy
+        if: inputs.rollback_type == 'terraform' || inputs.rollback_type == 'both'
+        run: |
+          terraform plan \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="github_org=naman833" \
+            -var="tf_state_bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -var="tf_lock_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -no-color 2>&1
+        working-directory: terraform/environments/${{ inputs.environment }}
+
+      - name: Notify Slack on completion
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          STATUS="${{ job.status }}"
+          COLOR="good"
+          if [ "$STATUS" = "failure" ]; then COLOR="danger"; fi
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"title\": \"Rollback $STATUS\",
+                \"text\": \"Environment: *${{ inputs.environment }}* | Type: *${{ inputs.rollback_type }}* | Triggered by: ${{ github.actor }}\",
+                \"footer\": \"cloud-platform-bootstrap\",
+                \"ts\": $(date +%s)
+              }]
+            }"

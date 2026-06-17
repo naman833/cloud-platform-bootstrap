@@ -1,0 +1,202 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  apply-dev:
+    name: Apply - dev
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+        working-directory: terraform/environments/dev
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="github_org=naman833" \
+            -var="tf_state_bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -var="tf_lock_table=${{ secrets.TF_LOCK_TABLE }}"
+        working-directory: terraform/environments/dev
+
+      - name: Health Check
+        run: bash scripts/health-check.sh dev
+        continue-on-error: true
+
+  apply-test:
+    name: Apply - test
+    runs-on: ubuntu-latest
+    environment: test
+    needs: apply-dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+        working-directory: terraform/environments/test
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="github_org=naman833" \
+            -var="tf_state_bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -var="tf_lock_table=${{ secrets.TF_LOCK_TABLE }}"
+        working-directory: terraform/environments/test
+
+      - name: Health Check
+        run: bash scripts/health-check.sh test
+        continue-on-error: true
+
+  apply-staging:
+    name: Apply - staging
+    runs-on: ubuntu-latest
+    environment: staging
+    needs: apply-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+        working-directory: terraform/environments/staging
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="github_org=naman833" \
+            -var="tf_state_bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -var="tf_lock_table=${{ secrets.TF_LOCK_TABLE }}"
+        working-directory: terraform/environments/staging
+
+      - name: Health Check
+        id: health
+        run: bash scripts/health-check.sh staging
+        continue-on-error: true
+
+      - name: Trigger Rollback on Failure
+        if: steps.health.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'rollback.yml',
+              ref: 'main',
+              inputs: {
+                environment: 'staging',
+                rollback_type: 'k8s'
+              }
+            });
+
+  apply-production:
+    name: Apply - production
+    runs-on: ubuntu-latest
+    environment: production
+    needs: apply-staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+        working-directory: terraform/environments/production
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="github_org=naman833" \
+            -var="tf_state_bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -var="tf_lock_table=${{ secrets.TF_LOCK_TABLE }}"
+        working-directory: terraform/environments/production
+
+      - name: Health Check
+        id: health
+        run: bash scripts/health-check.sh production
+        continue-on-error: true
+
+      - name: Trigger Rollback on Failure
+        if: steps.health.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'rollback.yml',
+              ref: 'main',
+              inputs: {
+                environment: 'production',
+                rollback_type: 'k8s'
+              }
+            });
